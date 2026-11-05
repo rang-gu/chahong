@@ -9,6 +9,7 @@ import { visFloorOf } from '../visFloor';
 
 const BUCKET = 'ohome';
 const PROBE = ['profiles', 'site_settings', 'posts', 'characters'];
+let subSeq = 0;   // 구독마다 채널 이름을 다르게 붙이기 위한 번호
 
 export async function createSupabaseBackend(
   cfg: Extract<BackendConfig, { kind: 'supabase' }>,
@@ -253,7 +254,7 @@ export async function createSupabaseBackend(
     },
 
     subscribe(coll, onChange) {
-      const ch = sb.channel(`ohome:${coll}`)
+      const ch = sb.channel(`ohome:${coll}:${++subSeq}`)
         .on('postgres_changes', { event: '*', schema: 'public', table: coll }, () => onChange())
         .subscribe();
       return () => { void sb.removeChannel(ch); };
