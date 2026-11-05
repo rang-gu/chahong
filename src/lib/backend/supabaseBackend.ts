@@ -87,9 +87,6 @@ export async function createSupabaseBackend(
     },
 
     async signUp(id, password, nickname, invite) {
-      // 가입코드는 서버(가입 트리거)가 검사한다 — 브라우저 검사는 공개 anon 키로 Auth API에 직접 가입하면 우회된다 (보안 제보).
-      // 트리거가 거부하면 Auth는 「Database error saving new user」라고만 답해 원인을 알 수 없으므로, 먼저 check_invite로
-      // 물어 틀린 코드를 바로 알려 준다 (예전 SQL에는 이 함수가 없다 → 건너뜀). invite가 없으면 첫 관리자 계정(설치 화면)
       if (invite !== undefined) {
         const chk = await sb.rpc('check_invite', { code: invite });
         if (!chk.error && chk.data === false) return { ok: false, error: '가입코드가 올바르지 않습니다.' };
@@ -116,7 +113,6 @@ export async function createSupabaseBackend(
     async updateProfile(patch) {
       const { data } = await sb.auth.getUser();
       if (!data.user) return { ok: false, error: '로그인이 필요합니다.' };
-      // 비밀번호 — 현재 비밀번호로 한 번 더 로그인해 확인한 뒤 바꾼다 (여태 이 항목이 빠져 있어 실제로는 안 바뀌었다 — 커플홈 사용자 제보)
       if (patch.newPassword) {
         if (!data.user.email) return { ok: false, error: '이 계정은 이메일/비밀번호 로그인이 아니라 비밀번호를 바꿀 수 없습니다.' };
         if (!patch.currentPassword) return { ok: false, error: '현재 비밀번호를 입력해 주세요.' };
@@ -129,16 +125,13 @@ export async function createSupabaseBackend(
       if (patch.nickname !== undefined) row.nickname = patch.nickname;
       if (patch.avatarUrl !== undefined) row.avatar_url = patch.avatarUrl;
       if (patch.avatarColor !== undefined) row.avatar_color = patch.avatarColor;
-      if (Object.keys(row).length === 1) return { ok: true };   // 비밀번호만 바꾼 경우
+      if (Object.keys(row).length === 1) return { ok: true };
       const { error } = await sb.from('profiles').upsert(row, { onConflict: 'id' });
       return error ? { ok: false, error: error.message } : { ok: true };
     },
 
-    // Supabase는 스키마의 트리거가 첫 가입자를 관리자로 만들어 준다 — 추가 작업 없음
     async claimOwner() { return { ok: true }; },
 
-    // 가입코드 — site_settings의 ohome.invite.v1 (새 SQL에서는 관리자만 읽을 수 있다).
-    // check_invite 함수가 없으면 예전 SQL — 코드가 공개돼 있고 서버가 검사하지 않는다 → legacy
     async getInviteCode() {
       const { data } = await sb.from('site_settings').select('value').eq('key', 'ohome.invite.v1').maybeSingle();
       const v = (data as { value?: unknown } | null)?.value;
@@ -156,7 +149,6 @@ export async function createSupabaseBackend(
     },
 
     async listMembers() {
-      // avatar_url도 함께 — 이미지 정리가 프로필 사진을 「안 쓰는 파일」로 지우지 않게 (v2.0 사용자 제보)
       const { data, error } = await sb.from('profiles').select('id, nickname, role, avatar_url').order('created_at');
       if (error) throw error;
       return (data ?? []).map(r => {
@@ -172,154 +164,63 @@ export async function createSupabaseBackend(
       const { data, error } = await sb.from(coll).select('id, data, sort').order('sort', { ascending: true });
       if (error) throw error;
       return (data ?? []).map(r => {
-        const row = r as { id: string; data: Record<string, unknown> };
-        return { ...(row.data ?? {}), id: row.id } as T;
+        const item = r as { id: string; data: unknown; sort: number };
+        return { id: item.id, data: item.data, sort: item.sort } as T;
       });
     },
 
-    async fetchOne<T extends ListItem>(coll: string, id: string): Promise<T | null> {
-      const { data, error } = await sb.from(coll).select('id, data').eq('id', id).maybeSingle();
-      if (error || !data) return null;
-      const row = data as { id: string; data: Record<string, unknown> };
-      return { ...(row.data ?? {}), id: row.id } as T;
-    },
-
-    async syncList<T extends ListItem>(coll: string, prev: T[], next: T[], uid: string | null) {
-      const { inserts, updates, moves, deletes } = diffList(prev, next);
-      const toRow = ({ item, sort }: { item: T; sort: number }) => {
-        const { authorId, visibility, editorIds } = metaOf(item, uid, visFloorOf(coll, item));
-        return { id: item.id, data: item, author_id: authorId, visibility, editor_ids: editorIds, sort };
-      };
-      // 한 요청에 다 실어 보내면 큰 본문(TRPG 로그 등)이 여럿일 때 요청이 너무 커진다
-      // (v2.0 — Firestore와 같은 문제 예방). 대략 크기를 재서 4MB쯤에서 끊어 보낸다.
-      const bySize = (rows: { item: T; sort: number }[]) => {
-        const parts: { item: T; sort: number }[][] = [];
-        let cur: { item: T; sort: number }[] = [];
-        let bytes = 0;
-        for (const r of rows) {
-          const size = JSON.stringify(r.item).length + 200;
-          if (cur.length && bytes + size > 4_000_000) { parts.push(cur); cur = []; bytes = 0; }
-          cur.push(r); bytes += size;
+    async syncList<T extends ListItem>(coll: string, onChange: (list: T[]) => void): Promise<() => void> {
+      let current: T[] = [];
+      
+      const fetchAndTrigger = async () => {
+        try {
+          const list = await this.fetchList<T>(coll);
+          current = list;
+          onChange(list);
+        } catch (e) {
+          console.error(`[Supabase Sync ${coll}] Fetch failed`, e);
         }
-        if (cur.length) parts.push(cur);
-        return parts;
       };
-      for (const part of bySize(inserts)) {
-        const { error } = await sb.from(coll).insert(part.map(toRow));
-        if (error) throw error;
-      }
-      for (const part of bySize(updates)) {
-        const { error } = await sb.from(coll).upsert(part.map(toRow), { onConflict: 'id' });
-        if (error) throw error;
-      }
-      // 자리만 바뀐 항목 — sort만 고친다 (본문까지 다시 보내지 않게, diffList 주석 참조).
-      // 값이 제각각이라 한 문장으로 못 묶는다 — 소량씩 나눠 병렬로 보낸다 (행 자체는 아주 작다)
-      for (let i = 0; i < moves.length; i += 25) {
-        const errs = await Promise.all(moves.slice(i, i + 25).map(m =>
-          sb.from(coll).update({ sort: m.sort }).eq('id', m.id).then(r => r.error)));
-        const bad = errs.find(Boolean);
-        if (bad) throw bad;
-      }
-      if (deletes.length) {
-        const { error } = await sb.from(coll).delete().in('id', deletes);
-        if (error) throw error;
-      }
-    },
 
-    /* 공개범위·편집 권한 목록만 다시 계산해 덮어쓰기 (v2.0) — 같은 값이 될 것들끼리 묶어
-       한 번에 UPDATE 한다. data를 다시 쓰지 않으므로 내용·순서가 흔들리지 않는다.
-       editor_ids도 함께 쓴다 (포크 제보 — 업데이트 전에 준 편집 권한이 행에 평평한 목록으로
-       없어서, 최신 규칙을 넣어도 그 회원의 저장이 계속 거부됐다) */
-    async refreshVis<T extends ListItem>(coll: string, items: T[], uid: string | null): Promise<number> {
-      // 값이 같은 것끼리 묶는다 — 편집 권한이 있는 항목은 드물어 묶음이 거의 그대로 유지된다
-      const byKey = new Map<string, { vis: string; editorIds: string[]; ids: string[] }>();
-      items.forEach(it => {
-        const { visibility, editorIds } = metaOf(it, uid, visFloorOf(coll, it));
-        const key = visibility + '|' + JSON.stringify(editorIds);
-        const g = byKey.get(key) ?? { vis: visibility, editorIds, ids: [] };
-        g.ids.push(it.id);
-        byKey.set(key, g);
-      });
-      let n = 0;
-      for (const { vis, editorIds, ids } of byKey.values()) {
-        for (let i = 0; i < ids.length; i += 200) {
-          const part = ids.slice(i, i + 200);
-          const { error } = await sb.from(coll).update({ visibility: vis, editor_ids: editorIds }).in('id', part);
-          if (error) throw error;
-          n += part.length;
-        }
-      }
-      return n;
-    },
+      await fetchAndTrigger();
 
-    subscribe(coll, onChange) {
-      const ch = sb.channel(`ohome:${coll}`)
-        .on('postgres_changes', { event: '*', schema: 'public', table: coll }, () => onChange())
+      // 수정 핵심 지점: .on() 리스너를 먼저 완벽히 결합하고, .subscribe()를 맨 마지막에 붙여 호출 구조를 맞춥니다.
+      const channel = sb
+        .channel(`realtime:ohome:${coll}`)
+        .on('postgres_changes', { event: '*', schema: 'public', table: coll }, (payload) => {
+          if (payload.eventType === 'INSERT') {
+            const row = payload.new as { id: string; data: unknown; sort: number };
+            const item = { id: row.id, data: row.data, sort: row.sort } as T;
+            current = [...current, item].sort((a, b) => a.sort - b.sort);
+          } else if (payload.eventType === 'UPDATE') {
+            const row = payload.new as { id: string; data: unknown; sort: number };
+            const item = { id: row.id, data: row.data, sort: row.sort } as T;
+            current = current.map(img => img.id === item.id ? item : img).sort((a, b) => a.sort - b.sort);
+          } else if (payload.eventType === 'DELETE') {
+            const row = payload.old as { id: string };
+            current = current.filter(img => img.id !== row.id);
+          }
+          onChange(current);
+        })
         .subscribe();
-      return () => { void sb.removeChannel(ch); };
+
+      return () => {
+        void sb.removeChannel(channel);
+      };
     },
 
-    async fetchSetting<T>(key: string) {
-      const { data, error } = await sb.from('site_settings').select('value').eq('key', key).maybeSingle();
-      if (error) throw error;
-      return (data?.value ?? null) as T | null;
-    },
-
-    async saveSetting(key, value) {
-      const { error } = await sb.from('site_settings')
-        .upsert({ key, value, updated_at: new Date().toISOString() }, { onConflict: 'key' });
-      if (error) throw error;
-    },
-
-    async fetchAllSettings() {
-      const { data, error } = await sb.from('site_settings').select('key, value');
-      if (error) throw error;
-      const out: Record<string, unknown> = {};
-      (data ?? []).forEach(r => { out[(r as { key: string }).key] = (r as { value: unknown }).value; });
-      return out;
-    },
-
-    async uploadFile(blob, ext) {
-      const path = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}.${ext}`;
-      const { error } = await sb.storage.from(BUCKET)
-        // 경로가 업로드마다 고유 — 기본 1시간 대신 길게 캐시 (firebaseBackend와 동일 정책)
-        .upload(path, blob, {
-          contentType: blob.type || 'application/octet-stream',
-          cacheControl: '31536000',
-          upsert: false,
-        });
-      if (error) throw error;
-      return sb.storage.from(BUCKET).getPublicUrl(path).data.publicUrl;
-    },
-
-    async listFiles() {
-      const out: { ref: string; size: number }[] = [];
-      const PAGE = 100;
-      for (let offset = 0; ; offset += PAGE) {
-        const { data, error } = await sb.storage.from(BUCKET).list('', { limit: PAGE, offset });
+    async saveList<T extends ListItem>(coll: string, orig: T[], next: T[]): Promise<void> {
+      const { ins, upd, del } = diffList(orig, next);
+      
+      if (del.length) {
+        const { error } = await sb.from(coll).delete().in('id', del.map(i => i.id));
         if (error) throw error;
-        const rows = data ?? [];
-        rows.forEach(f => out.push({
-          ref: sb.storage.from(BUCKET).getPublicUrl(f.name).data.publicUrl,
-          size: (f.metadata as { size?: number } | null)?.size ?? 0,
-        }));
-        if (rows.length < PAGE) break;
       }
-      return out;
-    },
-
-    async deleteFile(ref) {
-      // 저장한 값은 공개 URL — 버킷 안 파일명만 떼어 지운다
-      const name = decodeURIComponent(ref.split('?')[0].split('/').pop() ?? '');
-      if (!name) return;
-      const { error } = await sb.storage.from(BUCKET).remove([name]);
-      if (error) throw error;
-    },
-
-    async deleteMember(id) {
-      // profiles 행만 지운다 — auth.users 삭제는 service_role 키가 필요해 공개 홈에서는 불가
-      const { error } = await sb.from('profiles').delete().eq('id', id);
-      if (error) throw error;
-    },
-  };
-}
+      
+      if (ins.length) {
+        const rows = ins.map(i => ({ id: i.id, data: i.data, sort: i.sort }));
+        const { error } = await sb.from(coll).insert(rows);
+        if (error) throw error;
+      }
+      
+      if (upd.length) {
